@@ -18,7 +18,7 @@ from starlette import status
 from starlette.requests import Request
 
 from app.config import settings
-from app.database import engine, Base
+from app.database import async_session_factory, engine, Base
 from app.middleware import setup_middleware
 from app.routers import (
     auth,
@@ -125,6 +125,61 @@ def create_app() -> FastAPI:
                 logging.warning("Alembic migration stderr: %s", result.stderr)
         except Exception as e:
             logging.warning("Alembic migration failed (may be already applied): %s", e)
+
+        # Seed default tenant + admin user
+        await seed_default_admin()
+
+    async def seed_default_admin() -> None:
+        """Create the default tenant and admin user if they don't exist.
+
+        Idempotent — safe to run on every startup.
+        """
+        from sqlalchemy import select
+
+        from app.models.tenant import Tenant
+        from app.models.user import User
+        from app.services.auth_service import hash_password
+
+        async with async_session_factory() as session:
+            # Check if admin already exists
+            result = await session.execute(
+                select(User).where(User.email == settings.admin_email)
+            )
+            if result.scalar_one_or_none():
+                logging.info("Admin user already exists, skipping seed")
+                return
+
+            # Create default tenant
+            slug = settings.admin_email.split("@")[0].lower()
+            result = await session.execute(
+                select(Tenant).where(Tenant.slug == slug)
+            )
+            tenant = result.scalar_one_or_none()
+            if not tenant:
+                tenant = Tenant(
+                    name=settings.admin_email.split("@")[0],
+                    slug=slug,
+                    config="{}",
+                    active=True,
+                )
+                session.add(tenant)
+                await session.flush()
+                logging.info("Created default tenant: %s", slug)
+            else:
+                logging.info("Tenant %s already exists, reusing it", slug)
+
+            # Create admin user
+            admin = User(
+                tenant_id=tenant.id,
+                email=settings.admin_email,
+                password_hash=hash_password(settings.admin_password),
+                display_name="Admin",
+                role="admin",
+                active=True,
+            )
+            session.add(admin)
+            await session.commit()
+            logging.info("Seeded admin user: %s", settings.admin_email)
 
     @app.on_event("shutdown")
     async def on_shutdown():
