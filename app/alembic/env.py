@@ -22,8 +22,16 @@ from app.models import *  # noqa: F401, F403
 
 target_metadata = Base.metadata
 
-# Other config values
-# sqlalchemy.url is read from alembic.ini or environment
+# Override database URL from environment (Railway DATABASE_URL)
+# so the subprocess uses the same database as the app.
+import os
+_database_url = os.environ.get("DATABASE_URL")
+if _database_url:
+    if _database_url.startswith("postgresql://") and "+asyncpg" not in _database_url:
+        _database_url = _database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    elif _database_url.startswith("postgres://") and "+asyncpg" not in _database_url:
+        _database_url = _database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    config.set_main_option("sqlalchemy.url", _database_url)
 
 
 def run_migrations_offline() -> None:

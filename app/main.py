@@ -117,7 +117,8 @@ def create_app() -> FastAPI:
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "alembic", "upgrade", "head"],
-                capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent
+                capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent,
+                timeout=15,
             )
             if result.returncode == 0:
                 logging.info("Alembic migrations applied successfully")
