@@ -6,7 +6,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -41,8 +41,7 @@ class Orden(Base):
     )
 
     __table_args__ = (
-        # numero is unique per tenant
-        type("UniqueConstraint", (), {"__call__": lambda: None})(),
+        UniqueConstraint("tenant_id", "numero", name="uq_ordenes_tenant_numero"),
     )
 
     # Relationships
