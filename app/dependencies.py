@@ -6,7 +6,7 @@ to ensure the request is authenticated and tenant-scoped.
 """
 
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationError, HTTPBearer
+from fastapi.security import HTTPBearer
 from jwt import PyJWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
