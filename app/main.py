@@ -134,9 +134,11 @@ def create_app() -> FastAPI:
             logging.warning("Seed failed (db may not be ready yet): %s", e)
 
     async def seed_default_admin() -> None:
-        """Create the default tenant and admin user if they don't exist.
+        """Create or update the default tenant and admin user.
 
         Idempotent — safe to run on every startup.
+        If the admin_email or admin_password changed in env vars, the
+        existing user is updated in-place.
         """
         from sqlalchemy import select
 
@@ -145,16 +147,9 @@ def create_app() -> FastAPI:
         from app.services.auth_service import hash_password
 
         async with async_session_factory() as session:
-            # Check if admin already exists
-            result = await session.execute(
-                select(User).where(User.email == settings.admin_email)
-            )
-            if result.scalar_one_or_none():
-                logging.info("Admin user already exists, skipping seed")
-                return
-
-            # Create default tenant
             slug = settings.admin_email.split("@")[0].lower()
+
+            # Upsert default tenant
             result = await session.execute(
                 select(Tenant).where(Tenant.slug == slug)
             )
@@ -172,18 +167,32 @@ def create_app() -> FastAPI:
             else:
                 logging.info("Tenant %s already exists, reusing it", slug)
 
-            # Create admin user
-            admin = User(
-                tenant_id=tenant.id,
-                email=settings.admin_email,
-                password_hash=hash_password(settings.admin_password),
-                display_name="Admin",
-                role="admin",
-                active=True,
+            # Upsert admin user by email
+            hashed = hash_password(settings.admin_password)
+            result = await session.execute(
+                select(User).where(User.email == settings.admin_email)
             )
-            session.add(admin)
-            await session.commit()
-            logging.info("Seeded admin user: %s", settings.admin_email)
+            admin = result.scalar_one_or_none()
+            if admin:
+                # Update password if it changed
+                if admin.password_hash != hashed:
+                    admin.password_hash = hashed
+                    await session.commit()
+                    logging.info("Updated admin password for: %s", settings.admin_email)
+                else:
+                    logging.info("Admin user already up to date, skipping")
+            else:
+                admin = User(
+                    tenant_id=tenant.id,
+                    email=settings.admin_email,
+                    password_hash=hashed,
+                    display_name="Admin",
+                    role="admin",
+                    active=True,
+                )
+                session.add(admin)
+                await session.commit()
+                logging.info("Seeded admin user: %s", settings.admin_email)
 
     @app.on_event("shutdown")
     async def on_shutdown():
