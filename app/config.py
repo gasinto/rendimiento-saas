@@ -34,5 +34,14 @@ class Settings(BaseSettings):
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Railway injects DATABASE_URL as postgresql:// without +asyncpg suffix
+        # but SQLAlchemy async needs postgresql+asyncpg://
+        if self.database_url.startswith("postgresql://") and "+asyncpg" not in self.database_url:
+            self.database_url = self.database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        elif self.database_url.startswith("postgres://") and "+asyncpg" not in self.database_url:
+            self.database_url = self.database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+
 
 settings = Settings()

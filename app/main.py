@@ -6,6 +6,8 @@ and mounts all routers. Designed for Railway deployment.
 """
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -111,6 +113,18 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def on_startup():
         logging.info("Starting %s", settings.app_name)
+        # Run Alembic migrations on fresh database
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "alembic", "upgrade", "head"],
+                capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent
+            )
+            if result.returncode == 0:
+                logging.info("Alembic migrations applied successfully")
+            else:
+                logging.warning("Alembic migration stderr: %s", result.stderr)
+        except Exception as e:
+            logging.warning("Alembic migration failed (may be already applied): %s", e)
 
     @app.on_event("shutdown")
     async def on_shutdown():
