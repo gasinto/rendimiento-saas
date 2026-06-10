@@ -127,8 +127,11 @@ def create_app() -> FastAPI:
         except Exception as e:
             logging.warning("Alembic migration failed (may be already applied): %s", e)
 
-        # Seed default tenant + admin user
-        await seed_default_admin()
+        # Seed default tenant + admin user (non-fatal — app works without it)
+        try:
+            await seed_default_admin()
+        except Exception as e:
+            logging.warning("Seed failed (db may not be ready yet): %s", e)
 
     async def seed_default_admin() -> None:
         """Create the default tenant and admin user if they don't exist.
