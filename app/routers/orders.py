@@ -5,10 +5,13 @@ Replicates server.py APIHandler: listar_ordenes_detalle, agregar_orden_detalle,
 actualizar_orden_detalle, eliminar_orden_detalle, importar_ordenes.
 """
 
+import csv
+import io
 from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -131,6 +134,7 @@ async def list_ordenes(
     empresa_id: str | None = None,
     estado: str | None = None,
     resultado: str | None = None,
+    mes: str | None = None,
     q: str | None = None,
     limit: int = 100,
     offset: int = 0,
@@ -149,6 +153,8 @@ async def list_ordenes(
         stmt = stmt.where(Orden.estado == estado)
     if resultado:
         stmt = stmt.where(Orden.resultado == resultado)
+    if mes:
+        stmt = stmt.where(text("LEFT(fecha, 7) = :mes")).params(mes=mes)
     if q:
         pat = f"%{q.upper()}%"
         stmt = stmt.where(
@@ -281,6 +287,40 @@ async def update_orden(
     await db.flush()
     await db.refresh(orden)
     return {"ok": True}
+
+
+@router.get("/export/csv")
+async def export_ordenes_csv(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: int = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_user),
+):
+    """Export all work orders as CSV for this tenant."""
+    result = await db.execute(
+        select(Orden).where(Orden.tenant_id == tenant_id).order_by(Orden.fecha.desc(), Orden.numero.desc())
+    )
+    ordenes = result.scalars().all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "ID", "Numero", "Fecha", "Placa", "Falla", "Diagnostico", "Proceso",
+        "Solucion", "Estado", "Resultado", "Tipo", "Puntaje",
+        "Tipo Equipo", "Marca", "Modelo", "Creado"
+    ])
+    for o in ordenes:
+        writer.writerow([
+            o.id, o.numero, o.fecha, o.placa, o.falla, o.diagnostico, o.proceso,
+            o.solucion, o.estado, o.resultado, o.tipo, o.puntaje,
+            o.tipo_equipo, o.marca, o.modelo, o.created_at,
+        ])
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=reparaciones.csv"},
+    )
 
 
 @router.delete("/{orden_id}")
