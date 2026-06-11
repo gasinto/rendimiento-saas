@@ -1,11 +1,15 @@
 """Authentication router — register, login, token refresh."""
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from jwt import PyJWTError
-from sqlalchemy import select
+from pydantic import BaseModel
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import get_db
+from app.config import settings
+from app.database import async_session_factory, get_db
 from app.dependencies import get_current_user, require_role
 from app.models.user import User
 from app.schemas.auth import (
@@ -138,4 +142,80 @@ async def get_me(
         name=current_user.display_name,
         email=current_user.email,
         role=current_user.role,
+    )
+
+
+class SetupResponse(BaseModel):
+    ok: bool
+    detail: str
+
+
+@router.post("/setup", response_model=SetupResponse)
+async def setup_default_admin():
+    """Create the default tenant and admin user if they don't exist.
+
+    Unauthenticated — useful for first-time setup or recovery.
+    Safe to call multiple times (idempotent).
+    """
+    import bcrypt as _bcrypt
+
+    hashed = _bcrypt.hashpw(
+        settings.admin_password.encode("utf-8"),
+        _bcrypt.gensalt(rounds=10),
+    ).decode("utf-8")
+    slug = settings.admin_email.split("@")[0].lower()
+    name = settings.admin_email.split("@")[0]
+
+    async with async_session_factory() as session:
+        # Upsert tenant
+        try:
+            tenant_r = await session.execute(
+                text(
+                    """INSERT INTO tenants (name, slug, config, active)
+                       VALUES (:name, :slug, '{}', true)
+                       ON CONFLICT (slug) DO UPDATE SET name = :name2
+                       RETURNING id"""
+                ),
+                {"name": name, "slug": slug, "name2": name},
+            )
+            tenant_id = tenant_r.scalar_one()
+        except Exception as e:
+            await session.rollback()
+            logging.error("Setup — tenant upsert failed: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "setup_failed", "detail": f"Tenant creation failed: {e}"},
+            )
+
+        # Upsert admin user
+        try:
+            user_r = await session.execute(
+                text(
+                    """INSERT INTO users (tenant_id, email, password_hash, display_name, role, active)
+                       VALUES (:tid, :email, :pw, :display, 'admin', true)
+                       ON CONFLICT (email) DO UPDATE SET password_hash = :pw2
+                       RETURNING id"""
+                ),
+                {
+                    "tid": tenant_id,
+                    "email": settings.admin_email,
+                    "pw": hashed,
+                    "display": "Admin",
+                    "pw2": hashed,
+                },
+            )
+            user_id = user_r.scalar_one()
+            await session.commit()
+            logging.info("Setup — admin user ready: %s (id=%s)", settings.admin_email, user_id)
+        except Exception as e:
+            await session.rollback()
+            logging.error("Setup — admin user upsert failed: %s", e)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "setup_failed", "detail": f"Admin creation failed: {e}"},
+            )
+
+    return SetupResponse(
+        ok=True,
+        detail=f"Admin user '{settings.admin_email}' ready. Credenciales por defecto en el .env.example",
     )

@@ -1,465 +1,727 @@
-#!/usr/bin/env python3
 """
-Migrate SQLite database to PostgreSQL for rendimiento-saas.
+Migrate data from the local SQLite database (rendimiento.db) to Railway PostgreSQL.
+
+Reads the SQLite data, transforms it to match the SaaS schema (with tenants),
+and inserts into PostgreSQL. Designed to be run ONCE from a local machine.
 
 Usage:
-    python scripts/migrate_sqlite_to_pg.py
-
-Environment variables:
-    SQLITE_PATH   — path to SQLite DB file (default: rendimiento.db)
-    DATABASE_URL  — PostgreSQL connection string
+    DATABASE_URL="postgresql://..." python scripts/migrate_sqlite_to_pg.py
 """
 
-import json
 import os
 import sqlite3
 import sys
-from pathlib import Path
+from datetime import datetime
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from sqlalchemy import create_engine, text
 
-import asyncpg
+# ── Config ─────────────────────────────────────────────────────────────────────
+SQLITE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "rendimiento.db")
+PG_URL = os.environ.get("DATABASE_URL")
+if not PG_URL:
+    sys.exit("ERROR: Set DATABASE_URL env var to the Railway PostgreSQL URL")
 
+# Fix URL for async → sync (migration script uses sync SQLAlchemy)
+if "+asyncpg" in PG_URL:
+    PG_URL = PG_URL.replace("+asyncpg", "")
+elif PG_URL.startswith("postgresql://") or PG_URL.startswith("postgres://"):
+    pass
 
-# ── Config ────────────────────────────────────────────────────────────────
+# ── Connect ────────────────────────────────────────────────────────────────────
+print("🤝 Connecting to SQLite...")
+sqlite = sqlite3.connect(SQLITE_PATH)
+sqlite.row_factory = sqlite3.Row
+sc = sqlite.cursor()
 
-SQLITE_PATH = os.environ.get("SQLITE_PATH", "rendimiento.db")
-PG_DSN = os.environ.get("DATABASE_URL", "")
+print("🤝 Connecting to PostgreSQL...")
+pg = create_engine(PG_URL, pool_pre_ping=True)
+conn = pg.connect()
+conn.execution_options(isolation_level="AUTOCOMMIT")
 
-# Tables in order (respecting FK constraints)
-TABLES = [
-    "tenants",
-    "users",
-    "config",
-    "ordenes",
-    "reparaciones",
-    "sesiones_reparacion",
-    "puntajes",
-    "tipos_equipo",
-    "placas",
-    "notas_placa",
-    "mediciones_placa",
-    "bloques_placa",
-    "circuitos",
-    "mediciones",
-    "soluciones",
-    "referencias",
-    "diagramas",
-    "ic_marcas",
-    "ic_compatibilidad",
-]
+# Helper: shorthand for conn.execute(text(...), params)
+def run(sql, params: dict | None = None):
+    if isinstance(sql, str):
+        return conn.execute(text(sql), params or {})
+    return conn.execute(sql, params or {})
 
-# Map old empresas to new tenants
-EMPRESA_MAP = {}
-
-
-# ── SQLite helpers ────────────────────────────────────────────────────────
-
-def get_sqlite_conn(path: str) -> sqlite3.Connection:
-    """Open SQLite connection with row factory."""
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+# ── Helper: run a query and return all rows as dicts ──────────────────────────
+def sq(query: str) -> list[dict]:
+    sc.execute(query)
+    return [dict(r) for r in sc.fetchall()]
 
 
-def fetch_table(conn: sqlite3.Connection, table: str) -> list[dict]:
-    """Fetch all rows from a SQLite table as dicts."""
-    try:
-        cursor = conn.execute(f"SELECT * FROM [{table}]")
-        return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.OperationalError as e:
-        print(f"  ⚠  Table '{table}' not found in SQLite: {e}")
-        return []
+# ── Helper: get value or default ──────────────────────────────────────────────
+def v(row: dict, key: str, default=None):
+    return row.get(key, default)
 
 
-# ── Data transformation ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  1. EMPRESAS → TENANTS
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating empresas → tenants ──")
+empresas = sq("SELECT * FROM empresas")
+print(f"  Found {len(empresas)} empresas")
 
-def transform_tenants(rows: list[dict]) -> list[dict]:
-    """Map empresas → tenants with seeded config."""
-    result = []
-    for r in rows:
-        tid = r["id"]
-        EMPRESA_MAP[tid] = tid  # Preserve ID (1:1 mapping)
-        result.append({
-            "id": tid,
-            "name": r.get("nombre", f"Tenant {tid}"),
-            "slug": (r.get("nombre", f"tenant{tid}").lower()
-                     .replace(" ", "-")),
-            "active": True,
-        })
-    # Ensure at least one tenant
-    if not result:
-        result.append({"id": 1, "name": "NSP Notebooks",
-                       "slug": "nsp-notebooks", "active": True})
-        EMPRESA_MAP[1] = 1
-    return result
+# old_id → new_id mapping
+empresa_to_tenant = {}
+for emp in empresas:
+    name = emp["nombre"]
+    slug = name.lower().replace(" ", "-")
+    slug = "".join(c for c in slug if c.isalnum() or c == "-")  # sanitize
 
+    # Check if tenant already exists
+    existing = run(
+        text("SELECT id FROM tenants WHERE slug = :slug"), {"slug": slug}
+    ).fetchone()
 
-def transform_users(rows: list[dict]) -> list[dict]:
-    """Ensure at least one admin user exists."""
-    if rows:
-        return [
+    if existing:
+        tenant_id = existing[0]
+        print(f"  ⚠️  Tenant '{name}' (slug={slug}) already exists with id={tenant_id}, reusing")
+    else:
+        result = run(
+            text("""
+                INSERT INTO tenants (name, slug, config, active, created_at)
+                VALUES (:name, :slug, '{}', true, :created_at)
+                RETURNING id
+            """),
             {
-                "id": r["id"],
-                "tenant_id": EMPRESA_MAP.get(r.get("tenant_id", 1), 1),
-                "email": r["email"],
-                "password_hash": r["password_hash"],
-                "display_name": r.get("name", r.get("display_name", "")),
-                "role": r.get("role", "admin"),
-                "active": r.get("active", True),
-            }
-            for r in rows
-        ]
-    # No users yet — will be seeded by app startup
-    return []
+                "name": name,
+                "slug": slug,
+                "created_at": v(emp, "created_at", datetime.now().isoformat()),
+            },
+        )
+        tenant_id = result.scalar()
+        print(f"  ✅ Created tenant '{name}' with id={tenant_id}")
+
+    empresa_to_tenant[emp["id"]] = tenant_id
+
+if not empresa_to_tenant:
+    print("  ❌ No empresas found, nothing to migrate")
+    sys.exit(1)
+
+# ── Ensure the "admin" tenant exists (seed creates it on startup) ────────────
+admin_tenant = run(
+    text("SELECT id FROM tenants WHERE slug = 'admin'")
+).fetchone()
+if not admin_tenant:
+    print("  ⚠️  Admin tenant not found, will be created on next app restart (seed)")
 
 
-def transform_ordenes(rows: list[dict]) -> list[dict]:
-    return [
-        {
-            "id": r["id"],
-            "tenant_id": EMPRESA_MAP.get(1, 1),
-            "numero": r["numero"],
-            "fecha": r.get("fecha", ""),
-            "placa": r.get("placa", ""),
-            "falla": r.get("falla", ""),
-            "diagnostico": r.get("diagnostico", ""),
-            "proceso": r.get("proceso", ""),
-            "solucion": r.get("solucion", ""),
-            "estado": r.get("estado", "pendiente"),
-            "resultado": r.get("resultado", "n/a"),
-            "tipo": r.get("tipo", ""),
-            "puntaje": r.get("puntaje", 0),
-            "tipo_equipo": r.get("tipo_equipo", ""),
-            "marca": r.get("marca", ""),
-            "modelo": r.get("modelo", ""),
-            "checklist": r.get("checklist", ""),
-        }
-        for r in rows
-    ]
+# ═══════════════════════════════════════════════════════════════════════════════
+#  2. TIPOS_EQUIPO (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating tipos_equipo ──")
+tipos = sq("SELECT * FROM tipos_equipo")
+print(f"  Found {len(tipos)} tipos")
+tipo_id_map = {}
+for t in tipos:
+    existing = run(
+        text("SELECT id FROM tipos_equipo WHERE nombre = :nombre"),
+        {"nombre": t["nombre"]},
+    ).fetchone()
+    if existing:
+        tipo_id_map[t["id"]] = existing[0]
+        print(f"  ⚠️  Tipo '{t['nombre']}' already exists, id={existing[0]}")
+    else:
+        result = run(
+            text("""
+                INSERT INTO tipos_equipo (nombre, created_at)
+                VALUES (:nombre, :created_at)
+                RETURNING id
+            """),
+            {
+                "nombre": t["nombre"],
+                "created_at": v(t, "created_at", datetime.now().isoformat()),
+            },
+        )
+        new_id = result.scalar()
+        tipo_id_map[t["id"]] = new_id
+        print(f"  ✅ Inserted tipo '{t['nombre']}' → id={new_id}")
 
 
-def transform_reparaciones(rows: list[dict], ordenes_map: dict) -> list[dict]:
-    """Reparaciones with FK orden → ordenes.id remapping."""
-    result = []
-    for r in rows:
-        orden_numero = r.get("orden")
-        orden_id = ordenes_map.get(orden_numero)
-        if orden_id is None:
-            print(f"  ⚠  Reparacion id={r['id']}: orden #{orden_numero} "
-                  f"not found, skipping")
-            continue
-        result.append({
-            "id": r["id"],
-            "tenant_id": EMPRESA_MAP.get(1, 1),
-            "orden_id": orden_id,
-            "placa": r.get("placa", ""),
-            "falla": r.get("falla", ""),
-            "diagnostico": r.get("diagnostico", ""),
-            "proceso": r.get("proceso", ""),
-            "solucion": r.get("solucion", ""),
-            "estado": r.get("estado", "en_curso"),
-            "resultado": r.get("resultado", "n/a"),
-            "tipo": r.get("tipo", ""),
-            "tipo_equipo": r.get("tipo_equipo", ""),
-            "marca": r.get("marca", ""),
-            "modelo": r.get("modelo", ""),
-        })
-    return result
+# ═══════════════════════════════════════════════════════════════════════════════
+#  3. PLACAS (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating placas ──")
+placas = sq("SELECT * FROM placas")
+print(f"  Found {len(placas)} placas")
+placa_id_map = {}
+for p in placas:
+    existing = run(
+        text("SELECT id FROM placas WHERE modelo_placa = :modelo"),
+        {"modelo": p["modelo_placa"]},
+    ).fetchone()
+    if existing:
+        placa_id_map[p["id"]] = existing[0]
+    else:
+        tipo_id = tipo_id_map.get(v(p, "tipo_equipo_id")) if v(p, "tipo_equipo_id") else None
+        result = run(
+            text("""
+                INSERT INTO placas (modelo_placa, tipo_equipo_id, created_at)
+                VALUES (:modelo, :tipo_id, :created_at)
+                RETURNING id
+            """),
+            {
+                "modelo": p["modelo_placa"],
+                "tipo_id": tipo_id,
+                "created_at": v(p, "created_at", datetime.now().isoformat()),
+            },
+        )
+        placa_id_map[p["id"]] = result.scalar()
+print(f"  ✅ Inserted/mapped {len(placa_id_map)} placas")
 
 
-def transform_sesiones(rows: list[dict], ordenes_map: dict) -> list[dict]:
-    """Sesiones_reparacion with FK remapping."""
-    result = []
-    for r in rows:
-        orden_numero = r.get("orden_id") or r.get("numero")
-        orden_id = ordenes_map.get(orden_numero)
-        if orden_id is None:
-            print(f"  ⚠  Sesion id={r['id']}: orden #{orden_numero} "
-                  f"not found, skipping")
-            continue
-        result.append({
-            "id": r["id"],
-            "orden_id": orden_id,
-            "inicio": r.get("inicio", ""),
-            "fin": r.get("fin"),
-            "duracion_segundos": r.get("duracion_segundos", 0),
-            "notas": r.get("notas", ""),
-            "estado": r.get("estado", "finalizada"),
-        })
-    return result
+# ═══════════════════════════════════════════════════════════════════════════════
+#  4. CIRCUITOS (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating circuitos ──")
+circuitos = sq("SELECT * FROM circuitos")
+print(f"  Found {len(circuitos)} circuitos")
+inserted = 0
+for c in circuitos:
+    existing = run(
+        text("SELECT id FROM circuitos WHERE codigo = :codigo AND placa = :placa"),
+        {"codigo": c["codigo"], "placa": c["placa"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO circuitos (codigo, descripcion, placa, cantidad, info_detallada, created_at)
+                VALUES (:codigo, :descripcion, :placa, :cantidad, :info, :created_at)
+            """),
+            {
+                "codigo": c["codigo"],
+                "descripcion": v(c, "descripcion", ""),
+                "placa": c["placa"],
+                "cantidad": v(c, "cantidad", 1),
+                "info": v(c, "info_detallada", ""),
+                "created_at": v(c, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} circuitos, skipped {len(circuitos) - inserted}")
 
 
-def transform_puntajes(rows: list[dict]) -> list[dict]:
-    return [
-        {
-            "id": r["id"],
-            "tenant_id": EMPRESA_MAP.get(1, 1),
-            "tipo": r["tipo"],
-            "puntaje": r["puntaje"],
-        }
-        for r in rows
-    ]
+# ═══════════════════════════════════════════════════════════════════════════════
+#  5. MEDICIONES (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating mediciones ──")
+mediciones = sq("SELECT * FROM mediciones")
+print(f"  Found {len(mediciones)} mediciones")
+inserted = 0
+for m in mediciones:
+    existing = run(
+        text("SELECT id FROM mediciones WHERE codigo = :codigo AND placa = :placa AND pin = :pin"),
+        {"codigo": m["codigo"], "placa": m["placa"], "pin": m["pin"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO mediciones (codigo, placa, pin, nombre, valor_esperado, notas, created_at)
+                VALUES (:codigo, :placa, :pin, :nombre, :valor, :notas, :created_at)
+            """),
+            {
+                "codigo": m["codigo"],
+                "placa": m["placa"],
+                "pin": m["pin"],
+                "nombre": v(m, "nombre", ""),
+                "valor": v(m, "valor_esperado", ""),
+                "notas": v(m, "notas", ""),
+                "created_at": v(m, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} mediciones, skipped {len(mediciones) - inserted}")
 
 
-def noop(rows: list[dict]) -> list[dict]:
-    """Pass-through for global tables (no tenant_id)."""
-    return rows
+# ═══════════════════════════════════════════════════════════════════════════════
+#  6. SOLUCIONES (global — tenant_id is optional in PG)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating soluciones ──")
+soluciones = sq("SELECT * FROM soluciones")
+print(f"  Found {len(soluciones)} soluciones")
+inserted = 0
+for s in soluciones:
+    existing = run(
+        text("SELECT id FROM soluciones WHERE placa = :placa AND falla = :falla"),
+        {"placa": s["placa"], "falla": v(s, "falla", "")},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO soluciones (placa, falla, solucion, ics, created_at)
+                VALUES (:placa, :falla, :solucion, :ics, :created_at)
+            """),
+            {
+                "placa": s["placa"],
+                "falla": v(s, "falla", ""),
+                "solucion": v(s, "solucion", ""),
+                "ics": v(s, "ics", "[]"),
+                "created_at": v(s, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} soluciones, skipped {len(soluciones) - inserted}")
 
 
-# ── Table config ─────────────────────────────────────────────────────────
-
-TABLE_CONFIG = {
-    "tenants": {
-        "sqlite_table": "empresas",
-        "transform": transform_tenants,
-        "pg_table": "tenants",
-    },
-    "users": {
-        "sqlite_table": "users",
-        "transform": transform_users,
-        "pg_table": "users",
-    },
-    "config": {
-        "sqlite_table": "config",
-        "transform": noop,
-        "pg_table": "config",
-    },
-    "ordenes": {
-        "sqlite_table": "ordenes",
-        "transform": transform_ordenes,
-        "pg_table": "ordenes",
-    },
-    "reparaciones": {
-        "sqlite_table": "reparaciones",
-        "transform": transform_reparaciones,
-        "pg_table": "reparaciones",
-    },
-    "sesiones_reparacion": {
-        "sqlite_table": "sesiones_reparacion",
-        "transform": transform_sesiones,
-        "pg_table": "sesiones_reparacion",
-    },
-    "puntajes": {
-        "sqlite_table": "puntajes",
-        "transform": transform_puntajes,
-        "pg_table": "puntajes",
-    },
-    "tipos_equipo": {
-        "sqlite_table": "tipos_equipo",
-        "transform": noop,
-        "pg_table": "tipos_equipo",
-    },
-    "placas": {
-        "sqlite_table": "placas",
-        "transform": noop,
-        "pg_table": "placas",
-    },
-    "notas_placa": {
-        "sqlite_table": "notas_placa",
-        "transform": noop,
-        "pg_table": "notas_placa",
-    },
-    "mediciones_placa": {
-        "sqlite_table": "mediciones_placa",
-        "transform": noop,
-        "pg_table": "mediciones_placa",
-    },
-    "bloques_placa": {
-        "sqlite_table": "bloques_placa",
-        "transform": noop,
-        "pg_table": "bloques_placa",
-    },
-    "circuitos": {
-        "sqlite_table": "circuitos",
-        "transform": noop,
-        "pg_table": "circuitos",
-    },
-    "mediciones": {
-        "sqlite_table": "mediciones",
-        "transform": noop,
-        "pg_table": "mediciones",
-    },
-    "soluciones": {
-        "sqlite_table": "soluciones",
-        "transform": noop,
-        "pg_table": "soluciones",
-    },
-    "referencias": {
-        "sqlite_table": "referencias",
-        "transform": noop,
-        "pg_table": "referencias",
-    },
-    "diagramas": {
-        "sqlite_table": "diagramas",
-        "transform": noop,
-        "pg_table": "diagramas",
-    },
-    "ic_marcas": {
-        "sqlite_table": "ic_marcas",
-        "transform": noop,
-        "pg_table": "ic_marcas",
-    },
-    "ic_compatibilidad": {
-        "sqlite_table": "ic_compatibilidad",
-        "transform": noop,
-        "pg_table": "ic_compatibilidad",
-    },
-}
+# ═══════════════════════════════════════════════════════════════════════════════
+#  7. REFERENCIAS (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating referencias ──")
+referencias = sq("SELECT * FROM referencias")
+print(f"  Found {len(referencias)} referencias")
+inserted = 0
+for r in referencias:
+    existing = run(
+        text("SELECT id FROM referencias WHERE titulo = :titulo"),
+        {"titulo": r["titulo"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO referencias (categoria, titulo, contenido_html, created_at)
+                VALUES (:categoria, :titulo, :contenido, :created_at)
+            """),
+            {
+                "categoria": v(r, "categoria", "Electronica General"),
+                "titulo": r["titulo"],
+                "contenido": v(r, "contenido_html", ""),
+                "created_at": v(r, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} referencias, skipped {len(referencias) - inserted}")
 
 
-# ── PostgreSQL helpers ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  8. BLOQUES_PLACA (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating bloques_placa ──")
+bloques = sq("SELECT * FROM bloques_placa")
+print(f"  Found {len(bloques)} bloques")
+inserted = 0
+for b in bloques:
+    existing = run(
+        text("SELECT id FROM bloques_placa WHERE modelo_placa = :modelo AND nombre = :nombre"),
+        {"modelo": b["modelo_placa"], "nombre": b["nombre"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO bloques_placa (modelo_placa, nombre, sort_order)
+                VALUES (:modelo, :nombre, :sort)
+            """),
+            {
+                "modelo": b["modelo_placa"],
+                "nombre": b["nombre"],
+                "sort": v(b, "sort_order", 0),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} bloques, skipped {len(bloques) - inserted}")
 
-async def get_pg_conn(dsn: str):
-    """Create asyncpg connection."""
-    return await asyncpg.connect(dsn)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  9. NOTAS_PLACA (tenant_id = null → global or first tenant)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating notas_placa ──")
+notas = sq("SELECT * FROM notas_placa")
+print(f"  Found {len(notas)} notas")
+inserted = 0
+for n in notas:
+    existing = run(
+        text("SELECT id FROM notas_placa WHERE modelo_placa = :modelo AND contenido = :contenido"),
+        {"modelo": n["modelo_placa"], "contenido": n["contenido"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO notas_placa (modelo_placa, contenido, bloque, sort_order, created_at)
+                VALUES (:modelo, :contenido, :bloque, :sort, :created_at)
+            """),
+            {
+                "modelo": n["modelo_placa"],
+                "contenido": n["contenido"],
+                "bloque": v(n, "bloque", ""),
+                "sort": v(n, "sort_order", 0),
+                "created_at": v(n, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} notas, skipped {len(notas) - inserted}")
 
 
-async def truncate_tables(conn):
-    """Truncate all tables in reverse order (FK-safe)."""
-    for table in reversed(TABLES):
-        try:
-            await conn.execute(f"TRUNCATE TABLE \"{table}\" CASCADE")
-        except Exception as e:
-            print(f"  ⚠  Could not truncate {table}: {e}")
+# ═══════════════════════════════════════════════════════════════════════════════
+#  10. MEDICIONES_PLACA (tenant_id = null → global or first tenant)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating mediciones_placa ──")
+mps = sq("SELECT * FROM mediciones_placa")
+print(f"  Found {len(mps)} mediciones_placa")
+inserted = 0
+for m in mps:
+    existing = run(
+        text("SELECT id FROM mediciones_placa WHERE modelo_placa = :modelo AND punto_medicion = :punto"),
+        {"modelo": m["modelo_placa"], "punto": m["punto_medicion"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO mediciones_placa
+                    (modelo_placa, punto_medicion, nombre, valor_esperado, categoria,
+                     ic_referencia, notas, bloque, checked, sort_order, created_at)
+                VALUES (:modelo, :punto, :nombre, :valor, :categoria,
+                        :ic_ref, :notas, :bloque, :checked, :sort, :created_at)
+            """),
+            {
+                "modelo": m["modelo_placa"],
+                "punto": m["punto_medicion"],
+                "nombre": v(m, "nombre", ""),
+                "valor": v(m, "valor_esperado", ""),
+                "categoria": v(m, "categoria", ""),
+                "ic_ref": v(m, "ic_referencia", ""),
+                "notas": v(m, "notas", ""),
+                "bloque": v(m, "bloque", ""),
+                "checked": bool(v(m, "checked", 0)),
+                "sort": v(m, "sort_order", 0),
+                "created_at": v(m, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} mediciones_placa, skipped {len(mps) - inserted}")
 
 
-async def insert_rows(conn, table: str, rows: list[dict]):
-    """Batch insert rows into PostgreSQL table."""
-    if not rows:
-        print(f"  → {table}: 0 rows (empty)")
-        return 0
+# ═══════════════════════════════════════════════════════════════════════════════
+#  11. PUNTAJES (per tenant — insert for every empresa tenant)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating puntajes ──")
+puntajes = sq("SELECT * FROM puntajes")
+print(f"  Found {len(puntajes)} puntaje types")
 
-    # Get column names from first row
-    columns = list(rows[0].keys())
-    col_list = ", ".join(f'"{c}"' for c in columns)
-    placeholders = ", ".join(f"${i+1}" for i in range(len(columns)))
-    stmt = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders})'
+for tid in set(empresa_to_tenant.values()):
+    tenant_name = next(
+        (k for k, v in empresa_to_tenant.items() if v == tid), "unknown"
+    )
+    inserted = 0
+    for p in puntajes:
+        existing = run(
+            text("SELECT id FROM puntajes WHERE tenant_id = :tid AND tipo = :tipo"),
+            {"tid": tid, "tipo": p["tipo"]},
+        ).fetchone()
+        if not existing:
+            run(
+                text("""
+                    INSERT INTO puntajes (tenant_id, tipo, puntaje, created_at)
+                    VALUES (:tid, :tipo, :puntaje, :created_at)
+                """),
+                {
+                    "tid": tid,
+                    "tipo": p["tipo"],
+                    "puntaje": p["puntaje"],
+                    "created_at": datetime.now().isoformat(),
+                },
+            )
+            inserted += 1
+    print(f"  ✅ Tenant {tid}: inserted {inserted} puntajes")
 
-    # Convert rows to tuple list
-    values = [tuple(r[c] for c in columns) for r in rows]
 
-    try:
-        await conn.executemany(stmt, values)
-        print(f"  ✓ {table}: {len(rows)} rows")
-        return len(rows)
-    except Exception as e:
-        print(f"  ✗ {table}: ERROR — {e}")
-        # Try row by row for better error reporting
-        count = 0
-        for row in rows:
-            try:
-                await conn.execute(
-                    stmt, *[row[c] for c in columns]
+# ═══════════════════════════════════════════════════════════════════════════════
+#  12. CONFIG (per tenant — insert for every empresa tenant)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating config ──")
+configs = sq("SELECT * FROM config")
+print(f"  Found {len(configs)} config keys")
+
+for tid in set(empresa_to_tenant.values()):
+    inserted = 0
+    for cfg in configs:
+        existing = run(
+            text("SELECT 1 FROM config WHERE tenant_id = :tid AND clave = :clave"),
+            {"tid": tid, "clave": cfg["clave"]},
+        ).fetchone()
+        if not existing:
+            run(
+                text("""
+                    INSERT INTO config (tenant_id, clave, valor)
+                    VALUES (:tid, :clave, :valor)
+                """),
+                {"tid": tid, "clave": cfg["clave"], "valor": cfg["valor"]},
+            )
+            inserted += 1
+    print(f"  ✅ Tenant {tid}: inserted {inserted} config keys")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  13. ORDENES (per tenant — map empresa_id → tenant_id)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating ordenes ──")
+ordenes = sq("SELECT * FROM ordenes")
+print(f"  Found {len(ordenes)} ordenes")
+
+# old_id → new_id mapping for ordenes (needed for sesiones_reparacion)
+orden_id_map = {}
+
+for o in ordenes:
+    tid = empresa_to_tenant.get(o["empresa_id"])
+    if not tid:
+        print(f"  ⚠️  Skipping orden {o['id']}: no tenant for empresa_id={o['empresa_id']}")
+        continue
+
+    existing = run(
+        text("SELECT id FROM ordenes WHERE tenant_id = :tid AND numero = :numero"),
+        {"tid": tid, "numero": o["numero"]},
+    ).fetchone()
+
+    if existing:
+        orden_id_map[o["id"]] = existing[0]
+        print(f"  ⚠️  Orden num={o['numero']} already exists, id={existing[0]}")
+    else:
+        result = run(
+            text("""
+                INSERT INTO ordenes (tenant_id, numero, fecha, placa, falla, diagnostico,
+                    proceso, solucion, estado, resultado, tipo, puntaje, tipo_equipo,
+                    marca, modelo, checklist, created_at)
+                VALUES (:tid, :numero, :fecha, :placa, :falla, :diagnostico,
+                    :proceso, :solucion, :estado, :resultado, :tipo, :puntaje, :tipo_equipo,
+                    :marca, :modelo, :checklist, :created_at)
+                RETURNING id
+            """),
+            {
+                "tid": tid,
+                "numero": o["numero"],
+                "fecha": o["fecha"],
+                "placa": v(o, "placa", ""),
+                "falla": v(o, "falla", ""),
+                "diagnostico": v(o, "diagnostico", ""),
+                "proceso": v(o, "proceso", ""),
+                "solucion": v(o, "solucion", ""),
+                "estado": v(o, "estado", "en_curso"),
+                "resultado": v(o, "resultado", "n/a"),
+                "tipo": v(o, "tipo", ""),
+                "puntaje": v(o, "puntaje", 0),
+                "tipo_equipo": v(o, "tipo_equipo", ""),
+                "marca": v(o, "marca", ""),
+                "modelo": v(o, "modelo", ""),
+                "checklist": v(o, "checklist", "{}"),
+                "created_at": v(o, "created_at", datetime.now().isoformat()),
+            },
+        )
+        new_id = result.scalar()
+        orden_id_map[o["id"]] = new_id
+        print(f"  ✅ Inserted orden num={o['numero']} → id={new_id} (tenant={tid})")
+
+print(f"  📊 Created {len(orden_id_map)} orden mappings")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  14. REPARACIONES (per tenant — map orden number → ordenes.id)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating reparaciones ──")
+reparaciones = sq("SELECT * FROM reparaciones")
+print(f"  Found {len(reparaciones)} reparaciones")
+
+# Build a lookup: (tenant_id, numero) → orden_id
+# This is more reliable since reparaciones doesn't have empresa_id
+orden_num_lookup = {}
+for o in ordenes:
+    tid = empresa_to_tenant.get(o["empresa_id"])
+    if tid:
+        orden_num_lookup[(tid, o["numero"])] = orden_id_map.get(o["id"])
+
+inserted = 0
+skipped = 0
+for r in reparaciones:
+    # Find which tenant this repair belongs to by looking up the order number
+    # across all tenants
+    matched = False
+    for (tid, num), ord_id in orden_num_lookup.items():
+        if num == r["orden"]:
+            # Found a matching order — check if repair already exists
+            existing = run(
+                text("SELECT id FROM reparaciones WHERE tenant_id = :tid AND orden_id = :oid AND tipo = :tipo AND puntaje = :puntaje"),
+                {"tid": tid, "oid": ord_id, "tipo": r["tipo"], "puntaje": r["puntaje"]},
+            ).fetchone()
+            if not existing:
+                run(
+                    text("""
+                        INSERT INTO reparaciones (tenant_id, orden_id, fecha, tipo, puntaje, created_at)
+                        VALUES (:tid, :oid, :fecha, :tipo, :puntaje, :created_at)
+                    """),
+                    {
+                        "tid": tid,
+                        "oid": ord_id,
+                        "fecha": r["fecha"],
+                        "tipo": r["tipo"],
+                        "puntaje": r["puntaje"],
+                        "created_at": v(r, "created_at", datetime.now().isoformat()),
+                    },
                 )
-                count += 1
-            except Exception as e2:
-                print(f"    ✗ {table} row {row.get('id', '?')}: {e2}")
-        print(f"  → {table}: {count}/{len(rows)} rows inserted")
-        return count
+                inserted += 1
+            else:
+                skipped += 1
+            matched = True
+            break
+
+    if not matched:
+        print(f"  ⚠️  Could not match reparacion id={r['id']} (orden num={r['orden']}) — skipping")
+
+print(f"  ✅ Inserted {inserted} reparaciones, skipped {skipped}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  15. SESIONES_REPARACION (per tenant — map old orden_id → new orden_id)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating sesiones_reparacion ──")
+sesiones = sq("SELECT * FROM sesiones_reparacion")
+print(f"  Found {len(sesiones)} sesiones")
 
-async def main():
-    if not PG_DSN:
-        print("❌ DATABASE_URL environment variable not set")
-        sys.exit(1)
+inserted = 0
+skipped = 0
+for s in sesiones:
+    new_orden_id = orden_id_map.get(s["orden_id"])
+    if not new_orden_id:
+        print(f"  ⚠️  Could not map orden_id={s['orden_id']} for sesion id={s['id']}")
+        skipped += 1
+        continue
 
-    if not os.path.exists(SQLITE_PATH):
-        print(f"❌ SQLite DB not found: {SQLITE_PATH}")
-        sys.exit(1)
+    # Find tenant for this orden
+    tid = None
+    for o in ordenes:
+        if o["id"] == s["orden_id"]:
+            tid = empresa_to_tenant.get(o["empresa_id"])
+            break
+    if not tid:
+        print(f"  ⚠️  Could not determine tenant for sesion id={s['id']}")
+        skipped += 1
+        continue
 
-    # ── Step 1: Read SQLite ──────────────────────────────────────
-    print(f"📂 Reading SQLite: {SQLITE_PATH}")
-    sqlite_conn = get_sqlite_conn(SQLITE_PATH)
+    existing = run(
+        text("SELECT id FROM sesiones_reparacion WHERE orden_id = :oid AND inicio = :inicio"),
+        {"oid": new_orden_id, "inicio": s["inicio"]},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO sesiones_reparacion (orden_id, tenant_id, inicio, fin, duracion_segundos,
+                    notas, estado, created_at)
+                VALUES (:oid, :tid, :inicio, :fin, :duracion,
+                    :notas, :estado, :created_at)
+            """),
+            {
+                "oid": new_orden_id,
+                "tid": tid,
+                "inicio": s["inicio"],
+                "fin": v(s, "fin"),
+                "duracion": v(s, "duracion_segundos", 0),
+                "notas": v(s, "notas", ""),
+                "estado": v(s, "estado", "finalizada"),
+                "created_at": v(s, "created_at", datetime.now().isoformat()),
+            },
+        )
+        inserted += 1
+    else:
+        skipped += 1
 
-    # ── Step 2: Transform & prepare data ─────────────────────────
-    print("🔄 Transforming data...")
-
-    # Read empresas first (needed for ID mapping)
-    empresas = fetch_table(sqlite_conn, "empresas")
-    transform_tenants(empresas)
-
-    # Read ordenes for FK mapping
-    ordenes_raw = fetch_table(sqlite_conn, "ordenes")
-    ordenes_map = {r["numero"]: r["id"] for r in ordenes_raw}
-
-    all_data = {}
-    row_counts = {}
-
-    for table_key, cfg in TABLE_CONFIG.items():
-        raw = fetch_table(sqlite_conn, cfg["sqlite_table"])
-        transform_fn = cfg["transform"]
-
-        if table_key == "reparaciones":
-            transformed = transform_reparaciones(raw, ordenes_map)
-        elif table_key == "sesiones_reparacion":
-            transformed = transform_sesiones(raw, ordenes_map)
-        else:
-            transformed = transform_fn(raw)
-
-        all_data[table_key] = transformed
-        row_counts[table_key] = {"sqlite": len(raw), "pg": 0}
-
-    sqlite_conn.close()
-    print(f"   → {sum(rc['sqlite'] for rc in row_counts.values())} "
-          f"total rows from SQLite")
-
-    # ── Step 3: Connect to PostgreSQL ───────────────────────────
-    print(f"🐘 Connecting to PostgreSQL...")
-    pg_conn = await get_pg_conn(PG_DSN)
-
-    try:
-        # Truncate existing data
-        print("🧹 Truncating existing data...")
-        await truncate_tables(pg_conn)
-
-        # Insert data in dependency order
-        print("📥 Inserting data...")
-        total = 0
-        for table_key in TABLES:
-            cfg = TABLE_CONFIG.get(table_key)
-            if not cfg:
-                continue
-            rows = all_data.get(table_key, [])
-            inserted = await insert_rows(pg_conn, cfg["pg_table"], rows)
-            # Hack for sesiones_reparacion ID sequence (if PK is serial)
-            try:
-                await pg_conn.execute(
-                    f"SELECT setval(pg_get_serial_sequence("
-                    f"'{cfg[\"pg_table\"]}', 'id'), "
-                    f"COALESCE((SELECT MAX(id) FROM "
-                    f"\"{cfg['pg_table']}\"), 0) + 1)"
-                )
-            except Exception:
-                pass
-            row_counts[table_key]["pg"] = inserted
-            total += inserted
-
-        # ── Step 4: Validate ────────────────────────────────────
-        print("\n📊 Validation:")
-        all_ok = True
-        for table_key, rc in row_counts.items():
-            s = rc["sqlite"]
-            p = rc["pg"]
-            status = "✓" if s == p else "⚠"
-            if s != p:
-                all_ok = False
-            print(f"  {status} {table_key}: SQLite={s} PG={p}")
-
-        if all_ok:
-            print(f"\n✅ Migration complete! {total} rows migrated.")
-        else:
-            print(f"\n⚠ Migration finished with mismatches. "
-                  f"Review warnings above.")
-
-    finally:
-        await pg_conn.close()
+print(f"  ✅ Inserted {inserted} sesiones, skipped {skipped}")
 
 
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+# ═══════════════════════════════════════════════════════════════════════════════
+#  16. DIAGRAMAS (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating diagramas ──")
+diagramas = sq("SELECT * FROM diagramas")
+print(f"  Found {len(diagramas)} diagramas")
+# This is the biggest table (15003 rows). Use batch insert for performance.
+
+BATCH_SIZE = 500
+inserted = 0
+# Build param batches and use executemany for speed
+stmt = text("""
+    INSERT INTO diagramas (marca, modelo, tipo, gdrive_id, nombre_archivo, tamaño_mb, ultima_sync)
+    VALUES (:marca, :modelo, :tipo, :gdrive_id, :nombre, :tamano, :ultima_sync)
+    ON CONFLICT DO NOTHING
+""")
+for i in range(0, len(diagramas), BATCH_SIZE):
+    batch = diagramas[i : i + BATCH_SIZE]
+    params = [
+        {
+            "marca": v(d, "marca", ""),
+            "modelo": v(d, "modelo", ""),
+            "tipo": v(d, "tipo", ""),
+            "gdrive_id": v(d, "gdrive_id", ""),
+            "nombre": v(d, "nombre_archivo", ""),
+            "tamano": v(d, "tamaño_mb", 0),
+            "ultima_sync": v(d, "ultima_sync", ""),
+        }
+        for d in batch
+    ]
+    conn.execute(stmt, params)
+    inserted += len(batch)
+    print(f"    ... {inserted}/{len(diagramas)}")
+
+print(f"  ✅ Inserted {inserted} diagramas")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  17. IC_MARCAS (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating ic_marcas ──")
+ic_marcas = sq("SELECT * FROM ic_marcas")
+print(f"  Found {len(ic_marcas)} ic_marcas")
+inserted = 0
+for m in ic_marcas:
+    existing = run(
+        text("SELECT id FROM ic_marcas WHERE marking = :marking AND modelo = :modelo AND fabricante = :fabricante"),
+        {"marking": v(m, "marking", ""), "modelo": v(m, "modelo", ""), "fabricante": v(m, "fabricante", "")},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO ic_marcas (marking, modelo, fabricante, funcion, compatibilidad)
+                VALUES (:marking, :modelo, :fabricante, :funcion, :compatibilidad)
+            """),
+            {
+                "marking": v(m, "marking", ""),
+                "modelo": v(m, "modelo", ""),
+                "fabricante": v(m, "fabricante", ""),
+                "funcion": v(m, "funcion", ""),
+                "compatibilidad": v(m, "compatibilidad", ""),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} ic_marcas, skipped {len(ic_marcas) - inserted}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  18. IC_COMPATIBILIDAD (global)
+# ═══════════════════════════════════════════════════════════════════════════════
+print("\n── Migrating ic_compatibilidad ──")
+compat = sq("SELECT * FROM ic_compatibilidad")
+print(f"  Found {len(compat)} ic_compatibilidad")
+inserted = 0
+for c in compat:
+    existing = run(
+        text("SELECT id FROM ic_compatibilidad WHERE fabricante = :fab AND modelo = :mod AND compatibles = :comp"),
+        {"fab": v(c, "fabricante", ""), "mod": v(c, "modelo", ""), "comp": v(c, "compatibles", "")},
+    ).fetchone()
+    if not existing:
+        run(
+            text("""
+                INSERT INTO ic_compatibilidad (fabricante, modelo, compatibles)
+                VALUES (:fab, :mod, :comp)
+            """),
+            {
+                "fab": v(c, "fabricante", ""),
+                "mod": v(c, "modelo", ""),
+                "comp": v(c, "compatibles", ""),
+            },
+        )
+        inserted += 1
+print(f"  ✅ Inserted {inserted} ic_compatibilidad, skipped {len(compat) - inserted}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DONE
+# ═══════════════════════════════════════════════════════════════════════════════
+sqlite.close()
+pg.dispose()
+print("\n✅🎉 Migration complete!")

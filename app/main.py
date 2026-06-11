@@ -139,60 +139,64 @@ def create_app() -> FastAPI:
         Idempotent — safe to run on every startup.
         If the admin_email or admin_password changed in env vars, the
         existing user is updated in-place.
-        """
-        from sqlalchemy import select
 
-        from app.models.tenant import Tenant
-        from app.models.user import User
-        from app.services.auth_service import hash_password
+        Uses raw SQL so bcrypt import or ORM won't block startup.
+        """
+        import bcrypt as _bcrypt
+
+        hashed = _bcrypt.hashpw(
+            settings.admin_password.encode("utf-8"),
+            _bcrypt.gensalt(rounds=10),
+        ).decode("utf-8")
+        slug = settings.admin_email.split("@")[0].lower()
+        name = settings.admin_email.split("@")[0]
+
+        from sqlalchemy import text as _text
 
         async with async_session_factory() as session:
-            slug = settings.admin_email.split("@")[0].lower()
-
-            # Upsert default tenant
-            result = await session.execute(
-                select(Tenant).where(Tenant.slug == slug)
-            )
-            tenant = result.scalar_one_or_none()
-            if not tenant:
-                tenant = Tenant(
-                    name=settings.admin_email.split("@")[0],
-                    slug=slug,
-                    config="{}",
-                    active=True,
+            # Upsert tenant with raw SQL
+            try:
+                tenant_r = await session.execute(
+                    _text(
+                        """INSERT INTO tenants (name, slug, config, active)
+                           VALUES (:name, :slug, '{}', true)
+                           ON CONFLICT (slug) DO UPDATE SET name = :name2
+                           RETURNING id"""
+                    ),
+                    {"name": name, "slug": slug, "name2": name},
                 )
-                session.add(tenant)
-                await session.flush()
-                logging.info("Created default tenant: %s", slug)
-            else:
-                logging.info("Tenant %s already exists, reusing it", slug)
+                tenant_id = tenant_r.scalar_one()
+                logging.info("Tenant %s ready (id=%s)", slug, tenant_id)
+            except Exception as e:
+                logging.error("Tenant upsert failed: %s", e)
+                raise
 
-            # Upsert admin user by email
-            hashed = hash_password(settings.admin_password)
-            result = await session.execute(
-                select(User).where(User.email == settings.admin_email)
-            )
-            admin = result.scalar_one_or_none()
-            if admin:
-                # Update password if it changed
-                if admin.password_hash != hashed:
-                    admin.password_hash = hashed
-                    await session.commit()
-                    logging.info("Updated admin password for: %s", settings.admin_email)
-                else:
-                    logging.info("Admin user already up to date, skipping")
-            else:
-                admin = User(
-                    tenant_id=tenant.id,
-                    email=settings.admin_email,
-                    password_hash=hashed,
-                    display_name="Admin",
-                    role="admin",
-                    active=True,
+            # Upsert admin user with raw SQL
+            try:
+                user_r = await session.execute(
+                    _text(
+                        """INSERT INTO users (tenant_id, email, password_hash, display_name, role, active)
+                           VALUES (:tid, :email, :pw, :display, 'admin', true)
+                           ON CONFLICT (email) DO UPDATE SET password_hash = :pw2
+                           RETURNING id"""
+                    ),
+                    {
+                        "tid": tenant_id,
+                        "email": settings.admin_email,
+                        "pw": hashed,
+                        "display": "Admin",
+                        "pw2": hashed,
+                    },
                 )
-                session.add(admin)
+                user_id = user_r.scalar_one()
                 await session.commit()
-                logging.info("Seeded admin user: %s", settings.admin_email)
+                logging.info(
+                    "Admin user seeded: %s (id=%s)", settings.admin_email, user_id
+                )
+            except Exception as e:
+                await session.rollback()
+                logging.error("Admin user seed failed: %s", e)
+                raise
 
     @app.on_event("shutdown")
     async def on_shutdown():
