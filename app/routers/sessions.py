@@ -71,6 +71,7 @@ class TiemposResponse(BaseModel):
 
 
 @router.post("/start")
+@router.post("/iniciar", include_in_schema=False)
 async def start_session(
     data: SesionStartRequest,
     db: AsyncSession = Depends(get_db),
@@ -137,6 +138,7 @@ async def start_session(
 
 
 @router.post("/pause")
+@router.post("/pausar", include_in_schema=False)
 async def pause_session(
     data: SesionPauseRequest,
     db: AsyncSession = Depends(get_db),
@@ -170,6 +172,7 @@ async def pause_session(
 
 
 @router.post("/finish")
+@router.post("/finalizar", include_in_schema=False)
 async def finish_session(
     data: SesionFinishRequest,
     db: AsyncSession = Depends(get_db),
@@ -216,6 +219,8 @@ async def list_sessions(
 
 
 @router.get("/pending", response_model=PendienteResponse)
+# Spanish alias for frontend compatibility
+@router.get("/pendiente", response_model=PendienteResponse, include_in_schema=False)
 async def get_pending_session(
     db: AsyncSession = Depends(get_db),
     tenant_id: int = Depends(get_current_tenant),
