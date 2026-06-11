@@ -72,7 +72,7 @@ def rotate_refresh_token(old_token: str) -> tuple[str, str]:
     if payload.get("type") != "refresh":
         raise jwt.InvalidTokenError("Token is not a refresh token")
 
-    user_id = payload["sub"]
+    user_id = int(payload["sub"])
     tenant_id = payload["tenant_id"]
     role = payload["role"]
 

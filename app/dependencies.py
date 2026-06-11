@@ -42,7 +42,7 @@ async def get_current_user(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail={"code": "invalid_token", "detail": "Token is not an access token"},
             )
-        user_id: int = payload.get("sub")
+        user_id = int(payload.get("sub"))
     except PyJWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
