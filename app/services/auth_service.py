@@ -27,19 +27,25 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     )
 
 
+def _make_token(user_id: int, tenant_id: int, role: str, token_type: str, expire: datetime) -> str:
+    """Create a JWT token with standardized claims (RFC 7519)."""
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "tenant_id": tenant_id,
+        "role": role,
+        "type": token_type,
+        "exp": expire,
+        "iat": datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
 def create_access_token(user_id: int, tenant_id: int, role: str) -> str:
     """Create a short-lived JWT access token (15 min default)."""
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.access_token_expire_minutes
     )
-    payload: dict[str, Any] = {
-        "sub": user_id,
-        "tenant_id": tenant_id,
-        "role": role,
-        "type": "access",
-        "exp": expire,
-    }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    return _make_token(user_id, tenant_id, role, "access", expire)
 
 
 def create_refresh_token(user_id: int, tenant_id: int, role: str) -> str:
@@ -47,14 +53,7 @@ def create_refresh_token(user_id: int, tenant_id: int, role: str) -> str:
     expire = datetime.now(timezone.utc) + timedelta(
         days=settings.refresh_token_expire_days
     )
-    payload: dict[str, Any] = {
-        "sub": user_id,
-        "tenant_id": tenant_id,
-        "role": role,
-        "type": "refresh",
-        "exp": expire,
-    }
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    return _make_token(user_id, tenant_id, role, "refresh", expire)
 
 
 def decode_token(token: str) -> dict[str, Any]:
