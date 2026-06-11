@@ -323,6 +323,60 @@ async def export_ordenes_csv(
     )
 
 
+@router.get("/export/xlsx")
+async def export_ordenes_xlsx(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: int = Depends(get_current_tenant),
+    current_user: User = Depends(get_current_user),
+):
+    """Export all work orders as Excel (.xlsx) for this tenant."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+
+    result = await db.execute(
+        select(Orden).where(Orden.tenant_id == tenant_id).order_by(Orden.fecha.desc(), Orden.numero.desc())
+    )
+    ordenes = result.scalars().all()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Reparaciones"
+
+    headers = [
+        "ID", "Numero", "Fecha", "Placa", "Falla", "Diagnostico", "Proceso",
+        "Solucion", "Estado", "Resultado", "Tipo", "Puntaje",
+        "Tipo Equipo", "Marca", "Modelo", "Creado"
+    ]
+    header_font = Font(bold=True)
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, o in enumerate(ordenes, 2):
+        values = [
+            o.id, o.numero, o.fecha, o.placa, o.falla, o.diagnostico, o.proceso,
+            o.solucion, o.estado, o.resultado, o.tipo, o.puntaje,
+            o.tipo_equipo, o.marca, o.modelo, str(o.created_at),
+        ]
+        for col, v in enumerate(values, 1):
+            ws.cell(row=row_idx, column=col, value=v)
+
+    for col in ws.columns:
+        max_len = max(len(str(cell.value or "")) for cell in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 3, 80)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=reparaciones.xlsx"},
+    )
+
+
 @router.delete("/{orden_id}")
 async def delete_orden(
     orden_id: int,
