@@ -98,13 +98,13 @@ async def dashboard(
     # 1. Current month summary (from reparaciones)
     result = await db.execute(
         text("""
-            SELECT TO_CHAR(fecha, 'YYYY-MM') as mes,
+            SELECT LEFT(fecha, 7) as mes,
                    COUNT(*) as equipos,
                    COUNT(DISTINCT fecha) as dias,
                    SUM(puntaje) as puntos
             FROM reparaciones
             WHERE tenant_id = :tid
-              AND TO_CHAR(fecha, 'YYYY-MM') = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
+              AND LEFT(fecha, 7) = TO_CHAR(CURRENT_DATE, 'YYYY-MM')
             GROUP BY mes
         """),
         {"tid": tenant_id},
@@ -138,12 +138,11 @@ async def dashboard(
     # 2. Trend (last 12 months)
     result = await db.execute(
         text("""
-            SELECT TO_CHAR(fecha, 'YYYY-MM') as mes,
+            SELECT LEFT(fecha, 7) as mes,
                    COUNT(*) as equipos,
                    SUM(puntaje) as puntos
             FROM reparaciones
             WHERE tenant_id = :tid
-              AND fecha >= CURRENT_DATE - INTERVAL '12 months'
             GROUP BY mes
             ORDER BY mes ASC
         """),
@@ -188,12 +187,12 @@ async def dashboard(
     # 5. Annual summary
     result = await db.execute(
         text("""
-            SELECT TO_CHAR(fecha, 'YYYY') as anio,
+            SELECT LEFT(fecha, 4) as anio,
                    COUNT(*) as equipos,
                    SUM(puntaje) as puntos
             FROM reparaciones
             WHERE tenant_id = :tid
-              AND TO_CHAR(fecha, 'YYYY') = TO_CHAR(CURRENT_DATE, 'YYYY')
+              AND LEFT(fecha, 4) = TO_CHAR(CURRENT_DATE, 'YYYY')
             GROUP BY anio
         """),
         {"tid": tenant_id},
@@ -217,14 +216,14 @@ async def dashboard(
     # 6. Monthly success rate (last 12 months from ordenes)
     result = await db.execute(
         text("""
-            SELECT TO_CHAR(fecha, 'YYYY-MM') as mes,
+            SELECT LEFT(fecha, 7) as mes,
                    COUNT(*) as total,
                    SUM(CASE WHEN resultado = 'reparado' THEN 1 ELSE 0 END) as reparados,
                    SUM(CASE WHEN resultado = 'no_reparado' THEN 1 ELSE 0 END) as no_reparados,
                    SUM(CASE WHEN estado = 'en_curso' THEN 1 ELSE 0 END) as en_curso
             FROM ordenes
             WHERE tenant_id = :tid
-              AND fecha >= CURRENT_DATE - INTERVAL '12 months'
+              AND fecha::date >= CURRENT_DATE - INTERVAL '12 months'
             GROUP BY mes
             ORDER BY mes ASC
         """),
@@ -246,7 +245,7 @@ async def dashboard(
     # 7. Annual success rate
     result = await db.execute(
         text("""
-            SELECT TO_CHAR(fecha, 'YYYY') as anio,
+            SELECT LEFT(fecha, 4) as anio,
                    COUNT(*) as total,
                    SUM(CASE WHEN resultado = 'reparado' THEN 1 ELSE 0 END) as reparados,
                    SUM(CASE WHEN resultado = 'no_reparado' THEN 1 ELSE 0 END) as no_reparados,

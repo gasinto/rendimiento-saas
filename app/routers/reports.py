@@ -20,9 +20,11 @@ from app.models.user import User
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
 
-# ── Format mapping ────────────────────────────────────────────────────────
-# SQLite strftime → PostgreSQL TO_CHAR format mapping
-_PG_FORMATS = {"%Y-%m": "YYYY-MM", "%Y": "YYYY"}
+# ── Format helpers ────────────────────────────────────────────────────────
+# fecha is VARCHAR(10); use LEFT(len) instead of TO_CHAR
+def _left_len(tipo: str, alias: str = "") -> str:
+    col = f"{alias}.fecha" if alias else "fecha"
+    return f"LEFT({col}, 7)" if tipo == "mes" else f"LEFT({col}, 4)"
 
 
 # ── TXT helpers ─────────────────────────────────────────────────────────
@@ -135,8 +137,8 @@ async def informe_puntos(
     row = result.fetchone()
     valor_punto = float(row[0]) if row else 2000
 
-    # Map format for PostgreSQL TO_CHAR
-    fmt_sql = _PG_FORMATS.get(fmt, "YYYY-MM")
+    # LEFT(n) because fecha is VARCHAR, not a date column
+    left_expr = _left_len(tipo)
 
     # Desglose by type
     result = await db.execute(
@@ -144,7 +146,7 @@ async def informe_puntos(
             SELECT tipo, COUNT(*) as total, SUM(puntaje) as puntos
             FROM reparaciones
             WHERE tenant_id = :tid
-              AND TO_CHAR(fecha, '{fmt_sql}') = :periodo
+              AND {left_expr} = :periodo
             GROUP BY tipo
             ORDER BY total DESC
         """),
@@ -177,7 +179,7 @@ async def informe_puntos(
             SELECT COUNT(*) as equipos, COALESCE(SUM(puntaje), 0) as puntos
             FROM reparaciones
             WHERE tenant_id = :tid
-              AND TO_CHAR(fecha, '{fmt_sql}') = :prev
+              AND {left_expr} = :prev
         """),
         {"tid": tenant_id, "prev": prev_periodo},
     )
@@ -251,6 +253,7 @@ async def informe_puntos(
     lines.append(_r_line("═", w))
 
     # ── Detalle de equipos ──
+    left_expr_r = _left_len(tipo, alias="r")
     result = await db.execute(
         text(f"""
             SELECT r.fecha, r.orden_id, r.tipo, r.puntaje,
@@ -259,7 +262,7 @@ async def informe_puntos(
             FROM reparaciones r
             LEFT JOIN ordenes o ON r.orden_id = o.id
             WHERE r.tenant_id = :tid
-              AND TO_CHAR(r.fecha, '{fmt_sql}') = :periodo
+              AND {left_expr_r} = :periodo
             ORDER BY r.fecha DESC, r.orden_id DESC
         """),
         {"tid": tenant_id, "periodo": periodo},

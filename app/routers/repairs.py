@@ -96,7 +96,7 @@ async def list_months(
 
     result = await db.execute(
         text("""
-            SELECT TO_CHAR(fecha, 'YYYY-MM') as mes,
+            SELECT LEFT(fecha, 7) as mes,
                    COUNT(*) as equipos,
                    SUM(puntaje) as puntos_totales
             FROM reparaciones
@@ -137,7 +137,7 @@ async def list_repairs_by_month(
     """List repairs for a given month (YYYY-MM), or all if no month."""
     stmt = select(Reparacion).where(Reparacion.tenant_id == tenant_id)
     if mes:
-        stmt = stmt.where(text("TO_CHAR(fecha, 'YYYY-MM') = :mes")).params(mes=mes)
+        stmt = stmt.where(text("LEFT(fecha, 7) = :mes")).params(mes=mes)
     stmt = stmt.order_by(Reparacion.fecha.desc(), Reparacion.id.desc())
 
     result = await db.execute(stmt)
