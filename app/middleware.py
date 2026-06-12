@@ -13,11 +13,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
 
-logger = logging.getLogger("uvicorn.access")
+logger = logging.getLogger("rendimiento")
 
 
 def setup_middleware(app: FastAPI) -> None:
     """Register all middleware on the FastAPI application."""
+
+    # ── Logging config: own handler so uvicorn access log doesn't break ──
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
 
     # ── CORS ────────────────────────────────────────────────────
     app.add_middleware(
